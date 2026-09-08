@@ -1,0 +1,10 @@
+sample_rate: 48000
+chunk_size: 480
+stft_window_size: 256
+stft_hop_size: 128
+model_path: null
+input_device: null
+output_device: null
+ai_enabled: true
+target_latency_ms: 120
+noise_mode: "auto"
