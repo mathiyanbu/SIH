@@ -16,6 +16,11 @@ import soundfile as sf
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+try:
+    from gpiozero import Button
+except ImportError:
+    Button = None
+
 from ai_noise_canceller.audio.microphone import (
     get_default_output_index,
     get_platform_name,
@@ -30,6 +35,9 @@ RECORDINGS_DIR = ROOT / "recordings"
 SAMPLE_RATE = 48000
 FRAME_SIZE = 480
 PLAYBACK_GAIN = 2.0
+GPIO_RECORD_PIN = 17
+GPIO_PLAY_ORIGINAL_PIN = 27
+GPIO_PLAY_PROCESSED_PIN = 22
 
 
 def dbfs(audio: np.ndarray) -> float:
@@ -104,6 +112,8 @@ class NoiselessApp:
         self.process_time_ms = 0.0
         self.engine = None
         self.engine_error = ""
+        self.gpio_buttons = []
+        self.gpio_auto_process = False
         try:
             self.engine = RNNoiseEngine()
         except RNNoiseLoadError as exc:
@@ -136,6 +146,7 @@ class NoiselessApp:
         self.ab_var = tk.StringVar(value="ORIGINAL")
 
         self._build_ui()
+        self._setup_gpio_buttons()
         self._wave_stacked = False
         self.root.bind("<Configure>", self._on_resize)
         self.root.after(40, self._ui_tick)
@@ -143,6 +154,44 @@ class NoiselessApp:
     @staticmethod
     def _device_label(device):
         return f"{device['index']}: {device['name']}"
+
+    def _setup_gpio_buttons(self):
+        if Button is None:
+            print("[GPIO] gpiozero is not installed; physical buttons are disabled.")
+            return
+        try:
+            record_button = Button(GPIO_RECORD_PIN, pull_up=True, bounce_time=0.2)
+            original_button = Button(GPIO_PLAY_ORIGINAL_PIN, pull_up=True, bounce_time=0.2)
+            processed_button = Button(GPIO_PLAY_PROCESSED_PIN, pull_up=True, bounce_time=0.2)
+            self.gpio_buttons = [record_button, original_button, processed_button]
+            record_button.when_pressed = lambda: self.root.after(0, self._toggle_recording)
+            original_button.when_pressed = lambda: self.root.after(0, self._play_original_audio)
+            processed_button.when_pressed = lambda: self.root.after(0, self._play_processed_audio)
+            print("[GPIO] Buttons ready: GPIO17 record/stop, GPIO27 original, GPIO22 processed")
+        except Exception as exc:
+            print(f"[GPIO] Buttons unavailable: {exc}")
+            self._close_gpio_buttons()
+
+    def _close_gpio_buttons(self):
+        for button in self.gpio_buttons:
+            try:
+                button.close()
+            except Exception as exc:
+                print(f"[GPIO] Button close ERROR: {exc}")
+        self.gpio_buttons = []
+
+    def _toggle_recording(self):
+        if self.recording:
+            self.stop_recording()
+        else:
+            self.gpio_auto_process = True
+            self.start_recording()
+
+    def _play_original_audio(self):
+        self.play_audio(self.noisy_audio)
+
+    def _play_processed_audio(self):
+        self.play_audio(self.enhanced_audio)
 
     def _preferred_output_index(self):
         if get_platform_name() == "linux":
@@ -413,6 +462,9 @@ class NoiselessApp:
         self.noisy_audio = noisy
         self._show_recorded_audio()
         self.status_var.set("RECORDED")
+        if self.gpio_auto_process:
+            self.gpio_auto_process = False
+            self.process_audio()
 
     def _show_recorded_audio(self):
         self._draw_wave(self.input_wave, self.noisy_audio)
@@ -621,6 +673,7 @@ class NoiselessApp:
             print(text)
 
     def close(self):
+        self._close_gpio_buttons()
         self.recording = False
         self.stop_playback()
         if self.capture_stream is not None:
