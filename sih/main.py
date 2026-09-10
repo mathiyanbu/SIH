@@ -130,7 +130,9 @@ class NoiselessApp:
         self.impulse_var = tk.StringVar(value="NOT MEASURED")
         self.engine_status_var = tk.StringVar(value="READY" if self.engine else "ERROR")
         self.mic_var = tk.StringVar(value=self._device_label(self.inputs[0]) if self.inputs else "No microphone detected")
-        self.output_var = tk.StringVar(value=self._device_label(self.outputs[0]) if self.outputs else "Default output")
+        default_output = self._preferred_output_index()
+        default_output_device = next((device for device in self.outputs if device["index"] == default_output), None)
+        self.output_var = tk.StringVar(value=self._device_label(default_output_device) if default_output_device else "Default output")
         self.ab_var = tk.StringVar(value="ORIGINAL")
 
         self._build_ui()
@@ -141,6 +143,14 @@ class NoiselessApp:
     @staticmethod
     def _device_label(device):
         return f"{device['index']}: {device['name']}"
+
+    def _preferred_output_index(self):
+        if get_platform_name() == "linux":
+            for device in self.outputs:
+                name = str(device.get("name", "")).lower()
+                if "usb pnp" in name or "pcm2902" in name:
+                    return int(device["index"])
+        return get_default_output_index()
 
     def _build_ui(self):
         header = tk.Frame(self.root, bg="#0b100d", padx=22, pady=15)
@@ -497,11 +507,11 @@ class NoiselessApp:
     def _selected_output_index(self):
         selection = self.output_var.get()
         if not selection or selection.lower() in {"default output", "default", "no output"}:
-            return get_default_output_index()
+            return self._preferred_output_index()
         index = resolve_device_index(selection, self.outputs)
         if index is not None:
             return index
-        return get_default_output_index()
+        return self._preferred_output_index()
 
     def _validate_playback_audio(self, values):
         if not values.size:
