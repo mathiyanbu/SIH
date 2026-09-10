@@ -524,6 +524,7 @@ class NoiselessApp:
         return True
 
     def _play_worker(self, output_index):
+        stream = None
         try:
             normalized_index = normalize_device_index(output_index, kind="output")
             if normalized_index is None:
@@ -539,7 +540,7 @@ class NoiselessApp:
                 print(f"[Playback] Output device: {device.get('name', 'Default output')}")
             print(f"[Playback] Buffer size: {FRAME_SIZE}")
             print(f"[Playback] Output channels: {self.playback_channels}")
-            self.playback_stream = sd.OutputStream(
+            stream = sd.OutputStream(
                 device=normalized_index,
                 samplerate=SAMPLE_RATE,
                 channels=self.playback_channels,
@@ -548,21 +549,27 @@ class NoiselessApp:
                 callback=self._playback_callback,
                 finished_callback=self._playback_finished,
             )
-            self.playback_stream.start()
+            self.playback_stream = stream
+            stream.start()
             print("[Playback] Stream opened")
             print("[Playback] Playback started")
             while not self.playback_done.wait(0.05):
                 if self.playback_stop.is_set():
                     break
-            if self.playback_stream is not None:
-                self.playback_stream.stop()
-                self.playback_stream.close()
-                self.playback_stream = None
-            print("[Playback] Playback stopped safely")
         except Exception as exc:
-            self.playback_stream = None
             print(f"[Playback] ERROR: {exc}")
             self.root.after(0, self._error, f"PLAYBACK ERROR: {exc}. Check the output device and Linux audio stack (PipeWire/ALSA).")
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception as cleanup_error:
+                    print(f"[Playback] Cleanup ERROR: {cleanup_error}")
+                finally:
+                    if self.playback_stream is stream:
+                        self.playback_stream = None
+            print("[Playback] Playback stopped safely")
 
     def _playback_callback(self, outdata, frames, time_info, status):
         outdata.fill(0)
