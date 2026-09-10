@@ -17,6 +17,8 @@ def main():
     flags = 0
     if os.name == "nt":
         flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    else:
+        env["PYTHONPATH"] = f"{ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
     subprocess.Popen([sys.executable, str(APP_PATH)], cwd=str(ROOT), env=env, creationflags=flags)
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import platform
 import queue
 import threading
 import time
@@ -15,7 +16,13 @@ import soundfile as sf
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from ai_noise_canceller.audio.microphone import list_audio_devices
+from ai_noise_canceller.audio.microphone import (
+    get_default_output_index,
+    get_platform_name,
+    list_audio_devices,
+    normalize_device_index,
+    resolve_device_index,
+)
 from noise_suppression.rnnoise_engine import RNNoiseEngine, RNNoiseLoadError
 
 ROOT = Path(__file__).resolve().parent
@@ -333,10 +340,15 @@ class NoiselessApp:
         if self.recording:
             return
         if not self.inputs:
-            self._error("No microphone is available.")
+            self._error("No microphone is available. Connect a USB mic or headset and retry.")
             return
+
+        device_index = resolve_device_index(self.mic_var.get(), self.inputs)
+        if device_index is None:
+            self._error("The selected microphone is unavailable. Choose a detected input device.")
+            return
+
         try:
-            device_index = int(self.mic_var.get().split(":", 1)[0])
             self.capture_queue = queue.Queue(maxsize=32)
             self.record_chunks = []
             self.recording = True
@@ -349,7 +361,7 @@ class NoiselessApp:
             self.capture_worker.start()
         except Exception as exc:
             self.recording = False
-            self._error(f"Recording start failed: {exc}")
+            self._error(f"Recording start failed: {exc}. Check the microphone device and Linux audio configuration.")
 
     def _record_worker(self):
         while self.recording or not self.capture_queue.empty():
@@ -462,6 +474,11 @@ class NoiselessApp:
         values = np.asarray(audio, dtype=np.float32).reshape(-1).copy()
         if not self._validate_playback_audio(values):
             return
+
+        if not self.outputs:
+            self._error("No output device is available. Connect a speaker or Bluetooth headset and retry.")
+            return
+
         values = np.clip(values * PLAYBACK_GAIN, -1.0, 1.0).astype(np.float32)
         print(f"[Playback] Listening gain: {PLAYBACK_GAIN:.1f}x (playback only)")
         self.stop_playback()
@@ -471,16 +488,20 @@ class NoiselessApp:
             self.playback_buffer = values
             self.playback_position = 0
         output_index = self._selected_output_index()
+        if output_index is None:
+            self._error("The selected output device is unavailable. Choose a valid output device.")
+            return
         self.playback_thread = threading.Thread(target=self._play_worker, args=(output_index,), daemon=True)
         self.playback_thread.start()
 
     def _selected_output_index(self):
-        if self.output_var.get() and ":" in self.output_var.get():
-            try:
-                return int(self.output_var.get().split(":", 1)[0])
-            except ValueError:
-                return None
-        return None
+        selection = self.output_var.get()
+        if not selection or selection.lower() in {"default output", "default", "no output"}:
+            return get_default_output_index()
+        index = resolve_device_index(selection, self.outputs)
+        if index is not None:
+            return index
+        return get_default_output_index()
 
     def _validate_playback_audio(self, values):
         if not values.size:
@@ -504,14 +525,22 @@ class NoiselessApp:
 
     def _play_worker(self, output_index):
         try:
-            device = sd.query_devices(output_index, "output") if output_index is not None else sd.query_devices(kind="output")
-            max_channels = int(device.get("max_output_channels", 1))
-            self.playback_channels = 2 if max_channels >= 2 else 1
-            print(f"[Playback] Output device: {device.get('name', 'Default output')}")
+            normalized_index = normalize_device_index(output_index, kind="output")
+            if normalized_index is None:
+                normalized_index = get_default_output_index()
+            if normalized_index is None:
+                device = sd.query_devices(kind="output")
+                self.playback_channels = 1
+                print("[Playback] No valid output index found; using system default device")
+            else:
+                device = sd.query_devices(normalized_index, "output")
+                max_channels = int(device.get("max_output_channels", 1))
+                self.playback_channels = 2 if max_channels >= 2 else 1
+                print(f"[Playback] Output device: {device.get('name', 'Default output')}")
             print(f"[Playback] Buffer size: {FRAME_SIZE}")
             print(f"[Playback] Output channels: {self.playback_channels}")
             self.playback_stream = sd.OutputStream(
-                device=output_index,
+                device=normalized_index,
                 samplerate=SAMPLE_RATE,
                 channels=self.playback_channels,
                 dtype="float32",
@@ -533,7 +562,7 @@ class NoiselessApp:
         except Exception as exc:
             self.playback_stream = None
             print(f"[Playback] ERROR: {exc}")
-            self.root.after(0, self._error, f"PLAYBACK ERROR: {exc}")
+            self.root.after(0, self._error, f"PLAYBACK ERROR: {exc}. Check the output device and Linux audio stack (PipeWire/ALSA).")
 
     def _playback_callback(self, outdata, frames, time_info, status):
         outdata.fill(0)

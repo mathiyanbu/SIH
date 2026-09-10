@@ -2,27 +2,44 @@
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import sounddevice as sd
 
 
+def get_platform_name() -> str:
+    """Return a normalized platform name for Windows/Linux handling."""
+    name = sys.platform.lower()
+    if name.startswith("win"):
+        return "windows"
+    if name.startswith("linux"):
+        return "linux"
+    return "other"
+
+
 def list_audio_devices():
     """Return a list of available input/output devices in a simple format."""
-    devices = sd.query_devices()
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return []
+
     results = []
     for idx, device in enumerate(devices):
-        if isinstance(device, dict):
-            name = device.get("name", f"Device {idx}")
-            hostapi = device.get("hostapi")
-            max_input_channels = device.get("max_input_channels", 0)
-            max_output_channels = device.get("max_output_channels", 0)
-            results.append({
-                "index": idx,
-                "name": name,
-                "input": int(max_input_channels),
-                "output": int(max_output_channels),
-                "hostapi": hostapi,
-            })
+        if not isinstance(device, dict):
+            continue
+        name = device.get("name", f"Device {idx}")
+        hostapi = device.get("hostapi")
+        max_input_channels = int(device.get("max_input_channels", 0) or 0)
+        max_output_channels = int(device.get("max_output_channels", 0) or 0)
+        results.append({
+            "index": int(idx),
+            "name": str(name),
+            "input": max_input_channels,
+            "output": max_output_channels,
+            "hostapi": hostapi,
+        })
     return results
 
 
@@ -31,9 +48,71 @@ def select_input_device(index: int):
     devices = list_audio_devices()
     if not devices:
         raise RuntimeError("No audio devices were detected on this machine.")
-    if index < 0 or index >= len(devices):
-        raise ValueError(f"Device index {index} is out of range.")
-    return int(devices[index]["index"])
+
+    valid_indexes = {int(device["index"]) for device in devices if int(device.get("input", 0) or 0) > 0}
+    if index not in valid_indexes:
+        if not valid_indexes:
+            raise RuntimeError("No valid microphone input device was detected.")
+        raise ValueError(f"Device index {index} is out of range for the available inputs.")
+    return int(index)
+
+
+def normalize_device_index(index, kind: str = "input"):
+    """Return a non-negative device index only when it is valid for the requested kind."""
+    try:
+        value = int(index)
+    except (TypeError, ValueError):
+        return None
+
+    if value < 0:
+        return None
+
+    device_list = list_audio_devices()
+    if not device_list:
+        return None
+
+    required_channels = "input" if kind == "input" else "output"
+    valid_indexes = {int(device["index"]) for device in device_list if int(device.get(required_channels, 0) or 0) > 0}
+    if valid_indexes and value not in valid_indexes:
+        return None
+    return value
+
+
+def get_default_output_index():
+    """Return the default output device index for the current system when it is valid."""
+    try:
+        default_device = sd.default.device
+    except Exception:
+        return None
+
+    if isinstance(default_device, (list, tuple)) and len(default_device) >= 2:
+        return normalize_device_index(default_device[1], kind="output")
+    if isinstance(default_device, dict):
+        return normalize_device_index(default_device.get("output"), kind="output")
+    return normalize_device_index(default_device, kind="output")
+
+
+def resolve_device_index(selection: str | None, device_list: list[dict] | None = None):
+    """Parse a UI device string such as '2: USB Device' into a valid device index."""
+    if selection is None:
+        return None
+
+    device_list = device_list or list_audio_devices()
+    text = str(selection).strip()
+    if not text or text.lower() in {"default output", "default microphone", "no microphone detected", "default"}:
+        return None
+
+    try:
+        index = int(text.split(":", 1)[0].strip())
+    except ValueError:
+        return None
+
+    normalized = normalize_device_index(index, kind="output" if any(int(device.get("output", 0) or 0) > 0 for device in device_list) else "input")
+    if normalized is None:
+        return None
+    if any(int(device.get("index", -1)) == normalized for device in device_list):
+        return normalized
+    return None
 
 
 class AudioInput:
