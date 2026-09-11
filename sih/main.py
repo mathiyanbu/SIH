@@ -33,6 +33,7 @@ from ai_noise_canceller.audio.microphone import (
     select_output_device,
 )
 from noise_suppression.rnnoise_engine import RNNoiseEngine, RNNoiseLoadError
+from ai_noise_canceller.audio.network_stream import NETWORK_PORT, NetworkAudioServer
 
 ROOT = Path(__file__).resolve().parent
 RECORDINGS_DIR = ROOT / "recordings"
@@ -122,6 +123,8 @@ class NoiselessApp:
         self.live_output_wave_frames = deque(maxlen=100)
         self.live_waveform_after_id = None
         self.closing = False
+        self.network_server = None
+        self.network_enabled = True
         self.ai_enabled = True
         self.input_overflows = 0
         self.processing_errors = 0
@@ -163,9 +166,12 @@ class NoiselessApp:
         default_output_device = next((device for device in self.outputs if device["index"] == default_output), None)
         self.output_var = tk.StringVar(value=self._device_label(default_output_device) if default_output_device else "Default output")
         self.ab_var = tk.StringVar(value="ORIGINAL")
+        self.network_status_var = tk.StringVar(value="Starting")
+        self.network_url_var = tk.StringVar(value="Phone URL: unavailable")
 
         self._build_ui()
         self._setup_gpio_buttons()
+        self._setup_network_server()
         self._wave_stacked = False
         self.root.bind("<Configure>", self._on_resize)
         self.root.after(40, self._ui_tick)
@@ -248,6 +254,7 @@ class NoiselessApp:
         self._control_panel(controls, "RECORD AUDIO", self._record_controls).pack(side="left", fill="both", expand=True, padx=(0, 10))
         self._control_panel(controls, "PROCESS", self._process_controls).pack(side="left", fill="both", expand=True, padx=(0, 10))
         self._control_panel(controls, "PLAYBACK / A-B", self._playback_controls).pack(side="left", fill="both", expand=True)
+        self._control_panel(body, "NETWORK STREAMING", self._network_controls).pack(fill="x", pady=(8, 0))
 
         bottom = tk.Frame(body, bg="#101610")
         bottom.pack(fill="x", pady=(8, 0))
@@ -356,6 +363,14 @@ class NoiselessApp:
         tk.Radiobutton(ab, text="ORIGINAL", variable=self.ab_var, value="ORIGINAL", command=self.play_ab, bg="#0d2942", fg="#eef7ff", selectcolor="#1b4162", activebackground="#0d2942").pack(side="left")
         tk.Radiobutton(ab, text="ENHANCED", variable=self.ab_var, value="ENHANCED", command=self.play_ab, bg="#0d2942", fg="#eef7ff", selectcolor="#1b4162", activebackground="#0d2942").pack(side="left")
 
+    def _network_controls(self, panel):
+        row = tk.Frame(panel, bg="#0d2942")
+        row.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(row, textvariable=self.network_status_var, fg="#36db91", bg="#0d2942", font=("Arial", 9, "bold")).pack(side="left")
+        self.network_button = tk.Button(row, text="STOP PHONE STREAM", command=self.toggle_phone_stream, bg="#6e9b42", fg="white", bd=0, padx=10, pady=6, font=("Arial", 9, "bold"))
+        self.network_button.pack(side="right")
+        tk.Label(panel, textvariable=self.network_url_var, fg="#89a9c4", bg="#0d2942", font=("Arial", 9)).pack(anchor="w", padx=12, pady=(0, 8))
+
     def _info_panel(self, parent, title, rows):
         panel = tk.Frame(parent, bg="#171d18", bd=1, relief="solid")
         tk.Label(panel, text=title, fg="#ecf0e5", bg="#171d18", font=("Arial", 11, "bold")).pack(anchor="w", padx=13, pady=(11, 7))
@@ -386,7 +401,46 @@ class NoiselessApp:
         else:
             self.led.config(fg="#37df8b")
         self._report_live_diagnostics()
+        self._update_network_status()
         self.root.after(40, self._ui_tick)
+
+    def _setup_network_server(self):
+        self.network_server = NetworkAudioServer(status_provider=self._network_status_snapshot, port=NETWORK_PORT)
+        if self.network_server.start():
+            self.network_url_var.set(f"Phone URL: {self.network_server.display_url}")
+            self.network_status_var.set("Phone Streaming: Ready")
+        else:
+            print(f"[Network] Audio server unavailable: {self.network_server.start_error}")
+            self.network_status_var.set("Phone Streaming: Unavailable")
+            self.network_button.config(text="START PHONE STREAM", state="disabled")
+
+    def _network_status_snapshot(self):
+        return {"live": bool(self.live_processing), "enabled": bool(self.network_enabled)}
+
+    def _update_network_status(self):
+        if self.network_server is None or self.network_server.start_error:
+            return
+        clients = self.network_server.client_count
+        if not self.network_enabled:
+            status = "Phone Streaming: Stopped"
+        elif clients:
+            status = f"Phone Streaming: Connected ({clients})"
+        elif self.live_processing:
+            status = "Phone Streaming: Ready"
+        else:
+            status = "Phone Streaming: Waiting for live processing"
+        self.network_status_var.set(status)
+
+    def toggle_phone_stream(self):
+        if self.network_server is None or self.network_server.start_error:
+            return
+        self.network_enabled = not self.network_enabled
+        self.network_server.set_enabled(self.network_enabled)
+        if self.network_enabled:
+            self.network_button.config(text="STOP PHONE STREAM", bg="#6e9b42")
+        else:
+            self.network_button.config(text="START PHONE STREAM", bg="#303b30")
+        self._update_network_status()
 
     def _draw_wave(self, canvas, values):
         arr = np.asarray(values, dtype=np.float32).reshape(-1)
@@ -600,6 +654,8 @@ class NoiselessApp:
                 output = self.engine.process_frame(frame)
                 with self.live_waveform_lock:
                     self.live_output_wave_frames.append(np.asarray(output, dtype=np.float32).copy())
+                if self.network_server is not None:
+                    self.network_server.publish_frame(output)
                 try:
                     self.live_output_queue.put_nowait(output)
                 except queue.Full:
@@ -960,6 +1016,8 @@ class NoiselessApp:
                 self.capture_worker = None
         self.stop_playback()
         self.stop_live_processing()
+        if self.network_server is not None:
+            self.network_server.stop()
         if self.capture_stream is not None:
             self.capture_stream.stop()
             self.capture_stream.close()
