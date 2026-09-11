@@ -92,8 +92,44 @@ def get_default_output_index():
     return normalize_device_index(default_device, kind="output")
 
 
+def is_bluetooth_device(device):
+    name = str(device.get("name", "")).lower()
+    return any(keyword in name for keyword in ("bluetooth", "bluez", "a2dp", "headset", "earbuds", "airpods"))
+
+
+def select_output_device(devices=None):
+    """Choose a capable output, preferring Bluetooth, then existing USB, then default."""
+    devices = devices if devices is not None else list_audio_devices()
+    outputs = [device for device in devices if int(device.get("output", 0) or 0) > 0]
+    if not outputs:
+        return None
+
+    bluetooth_output = next((device for device in outputs if is_bluetooth_device(device)), None)
+    if bluetooth_output is not None:
+        return int(bluetooth_output["index"])
+
+    usb_output = next(
+        (device for device in outputs if any(keyword in str(device.get("name", "")).lower() for keyword in ("usb", "usb pnp", "pcm2902"))),
+        None,
+    )
+    if usb_output is not None:
+        return int(usb_output["index"])
+
+    default_index = get_default_output_index()
+    if default_index is not None:
+        return default_index
+    return int(outputs[0]["index"])
+
+
+def _selection_matches_device(text, device):
+    if ":" not in text:
+        return True
+    selected_name = text.split(":", 1)[1].strip()
+    return selected_name == str(device.get("name", ""))
+
+
 def resolve_device_index(selection: str | None, device_list: list[dict] | None = None):
-    """Parse a UI device string such as '2: USB Device' into a valid device index."""
+    """Parse a UI device string and ensure its index still names the same device."""
     if selection is None:
         return None
 
@@ -107,12 +143,14 @@ def resolve_device_index(selection: str | None, device_list: list[dict] | None =
     except ValueError:
         return None
 
-    normalized = normalize_device_index(index, kind="output" if any(int(device.get("output", 0) or 0) > 0 for device in device_list) else "input")
+    selected_device = next((device for device in device_list if int(device.get("index", -1)) == index), None)
+    if selected_device is None or not _selection_matches_device(text, selected_device):
+        return None
+    kind = "output" if int(selected_device.get("output", 0) or 0) > 0 else "input"
+    normalized = normalize_device_index(index, kind=kind)
     if normalized is None:
         return None
-    if any(int(device.get("index", -1)) == normalized for device in device_list):
-        return normalized
-    return None
+    return normalized
 
 
 class AudioInput:

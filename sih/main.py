@@ -27,6 +27,8 @@ from ai_noise_canceller.audio.microphone import (
     list_audio_devices,
     normalize_device_index,
     resolve_device_index,
+    is_bluetooth_device,
+    select_output_device,
 )
 from noise_suppression.rnnoise_engine import RNNoiseEngine, RNNoiseLoadError
 
@@ -103,6 +105,15 @@ class NoiselessApp:
         self.playback_channels = 1
         self.playback_lock = threading.Lock()
         self.playback_thread = None
+        self.live_streams = []
+        self.live_worker = None
+        self.live_stop = threading.Event()
+        self.live_input_queue = queue.Queue(maxsize=8)
+        self.live_output_queue = queue.Queue(maxsize=16)
+        self.live_processing = False
+        self.live_overflows = 0
+        self.live_underruns = 0
+        self.live_last_diagnostic = 0.0
         self.ai_enabled = True
         self.input_overflows = 0
         self.processing_errors = 0
@@ -194,12 +205,7 @@ class NoiselessApp:
         self.play_audio(self.enhanced_audio)
 
     def _preferred_output_index(self):
-        if get_platform_name() == "linux":
-            for device in self.outputs:
-                name = str(device.get("name", "")).lower()
-                if "usb pnp" in name or "pcm2902" in name:
-                    return int(device["index"])
-        return get_default_output_index()
+        return select_output_device(self.outputs)
 
     def _build_ui(self):
         header = tk.Frame(self.root, bg="#0b100d", padx=22, pady=15)
@@ -310,7 +316,8 @@ class NoiselessApp:
     def _record_controls(self, panel):
         row = tk.Frame(panel, bg="#0d2942")
         row.pack(fill="x", padx=10)
-        ttk.Combobox(row, textvariable=self.mic_var, values=[self._device_label(d) for d in self.inputs] or ["No microphone detected"], state="readonly", width=25).pack(side="left")
+        self.mic_selector = ttk.Combobox(row, textvariable=self.mic_var, values=[self._device_label(d) for d in self.inputs] or ["No microphone detected"], state="readonly", width=25)
+        self.mic_selector.pack(side="left")
         self.record_start_button = tk.Button(row, text="START RECORDING", command=self.start_recording, bg="#e84b54", fg="white", bd=0, padx=10, pady=7, font=("Arial", 10, "bold"))
         self.record_start_button.pack(side="left", padx=(8, 4))
         tk.Button(row, text="STOP", command=self.stop_recording, bg="#203f5e", fg="white", bd=0, padx=12, pady=7, font=("Arial", 10, "bold")).pack(side="left")
@@ -319,12 +326,17 @@ class NoiselessApp:
     def _process_controls(self, panel):
         self.process_button = tk.Button(panel, text="PROCESS WITH RNNOISE", command=self.process_audio, bg="#2e9ee8", fg="white", bd=0, padx=14, pady=9, font=("Arial", 11, "bold"))
         self.process_button.pack(anchor="w", padx=12, pady=(2, 6))
+        self.live_button = tk.Button(panel, text="START LIVE PROCESSING", command=self.toggle_live_processing, bg="#6e9b42", fg="white", bd=0, padx=14, pady=9, font=("Arial", 10, "bold"))
+        self.live_button.pack(anchor="w", padx=12, pady=(0, 6))
         tk.Label(panel, textvariable=self.engine_status_var, fg="#36db91", bg="#0d2942", font=("Arial", 10, "bold")).pack(anchor="w", padx=12)
-        tk.Label(panel, text="Only recorded audio is processed in this mode", fg="#89a9c4", bg="#0d2942", font=("Arial", 9)).pack(anchor="w", padx=12, pady=(4, 10))
+        tk.Label(panel, text="Recorded and live processing are independent", fg="#89a9c4", bg="#0d2942", font=("Arial", 9)).pack(anchor="w", padx=12, pady=(4, 10))
 
     def _playback_controls(self, panel):
         row = tk.Frame(panel, bg="#0d2942")
         row.pack(fill="x", padx=10)
+        self.output_selector = ttk.Combobox(row, textvariable=self.output_var, values=[self._device_label(d) for d in self.outputs] or ["Default output"], state="readonly", width=25)
+        self.output_selector.pack(side="left", padx=(0, 8))
+        tk.Button(row, text="REFRESH", command=self.refresh_audio_devices, bg="#303b30", fg="white", bd=0, padx=8, pady=7, font=("Arial", 9, "bold")).pack(side="left")
         tk.Button(row, text="PLAY ORIGINAL", command=lambda: self.play_audio(self.noisy_audio), bg="#b74754", fg="white", bd=0, padx=9, pady=7, font=("Arial", 10, "bold")).pack(side="left", padx=(0, 4))
         tk.Button(row, text="PLAY ENHANCED", command=lambda: self.play_audio(self.enhanced_audio), bg="#229d70", fg="white", bd=0, padx=9, pady=7, font=("Arial", 10, "bold")).pack(side="left", padx=4)
         tk.Button(row, text="STOP AUDIO", command=self.stop_playback, bg="#203f5e", fg="white", bd=0, padx=9, pady=7, font=("Arial", 10, "bold")).pack(side="left", padx=4)
@@ -395,8 +407,210 @@ class NoiselessApp:
         except queue.Full:
             self.input_overflows += 1
 
+    def _live_diagnostic(self, message, count):
+        now = time.monotonic()
+        if count == 1 or now - self.live_last_diagnostic >= 2.0:
+            print(f"[Live] {message}: {count}")
+            self.live_last_diagnostic = now
+
+    def _enumerate_devices(self):
+        self.devices = audio_devices()
+        self.inputs = [device for device in self.devices if device.get("input", 0) > 0]
+        self.outputs = [device for device in self.devices if device.get("output", 0) > 0]
+
+    def _clear_live_queues(self):
+        for live_queue in (self.live_input_queue, self.live_output_queue):
+            try:
+                while True:
+                    live_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+    def refresh_audio_devices(self):
+        if self.live_processing or self.recording:
+            self._error("Stop recording or live processing before refreshing audio devices.")
+            return
+        old_mic = self.mic_var.get()
+        old_output = self.output_var.get()
+        self._enumerate_devices()
+        if hasattr(self, "mic_selector"):
+            self.mic_selector.configure(values=[self._device_label(device) for device in self.inputs] or ["No microphone detected"])
+        selected_mic = resolve_device_index(old_mic, self.inputs)
+        mic_device = next((device for device in self.inputs if device["index"] == selected_mic), None)
+        self.mic_var.set(self._device_label(mic_device) if mic_device else (self._device_label(self.inputs[0]) if self.inputs else "No microphone detected"))
+        if hasattr(self, "output_selector"):
+            values = [self._device_label(device) for device in self.outputs] or ["Default output"]
+            self.output_selector.configure(values=values)
+        selected_output = resolve_device_index(old_output, self.outputs)
+        output_device = next((device for device in self.outputs if device["index"] == selected_output), None)
+        if output_device is None:
+            preferred = self._preferred_output_index()
+            output_device = next((device for device in self.outputs if device["index"] == preferred), None)
+        self.output_var.set(self._device_label(output_device) if output_device else "Default output")
+        print("[Audio] Devices refreshed")
+        for device in self.devices:
+            print(f"[Audio] [{device['index']}] {device['name']} input={device['input']} output={device['output']}")
+
+    def _live_input_callback(self, indata, frames, time_info, status):
+        if status:
+            self.input_overflows += int(getattr(status, "input_overflow", False))
+        if not self.live_processing:
+            return
+        try:
+            self.live_input_queue.put_nowait(np.asarray(indata[:, 0], dtype=np.float32).copy())
+        except queue.Full:
+            self.live_overflows += 1
+            self._live_diagnostic("input queue overflow; dropped frame", self.live_overflows)
+
+    def _live_output_callback(self, outdata, frames, time_info, status):
+        outdata.fill(0)
+        if status:
+            self.live_underruns += int(getattr(status, "output_underflow", False))
+        try:
+            frame = self.live_output_queue.get_nowait()
+        except queue.Empty:
+            self.live_underruns += 1
+            self._live_diagnostic("output underrun; emitted silence", self.live_underruns)
+            return
+        count = min(frames, len(frame))
+        outdata[:count, 0] = frame[:count]
+        if outdata.shape[1] > 1:
+            outdata[:count, 1:] = frame[:count, None]
+
+    def toggle_live_processing(self):
+        if self.live_processing:
+            if self.stop_live_processing():
+                self.live_button.config(text="START LIVE PROCESSING", bg="#6e9b42")
+        elif self.start_live_processing():
+            self.live_button.config(text="STOP LIVE PROCESSING", bg="#b93c36")
+
+    def start_live_processing(self):
+        if self.live_processing:
+            return False
+        if self.recording:
+            self._error("Stop recording before starting live processing.")
+            return False
+        if self.engine is None:
+            self._error(self.engine_error or "RNNoise is not loaded.")
+            return False
+
+        self._enumerate_devices()
+        if not self.inputs:
+            self._error("No microphone is available. Connect a USB mic or headset and retry.")
+            return False
+        if not self.outputs:
+            print("[Live] Bluetooth sink is not visible to PortAudio; no output-capable fallback is available.")
+            self._error("No output device visible to PortAudio. Check PipeWire/PulseAudio/ALSA and Bluetooth routing.")
+            return False
+
+        input_index = resolve_device_index(self.mic_var.get(), self.inputs)
+        output_index = self._selected_output_index()
+        if input_index is None:
+            self._error("The selected microphone is unavailable. Choose a detected input device.")
+            return False
+        if output_index is None:
+            self._error("No valid output device was detected.")
+            return False
+
+        input_device = next((device for device in self.inputs if device["index"] == input_index), None)
+        output_device = next((device for device in self.outputs if device["index"] == output_index), None)
+        if not any(is_bluetooth_device(device) for device in self.outputs):
+            print("[Live] Bluetooth sink is not visible to PortAudio; using a valid fallback output.")
+        self.stop_playback()
+        print(f"[Live] Input device: [{input_index}] {input_device['name'] if input_device else 'Default input'}")
+        print(f"[Live] Output device: [{output_index}] {output_device['name'] if output_device else 'Default output'}")
+        try:
+            self.live_input_queue = queue.Queue(maxsize=8)
+            self.live_output_queue = queue.Queue(maxsize=16)
+            self._clear_live_queues()
+            self.live_stop.clear()
+            self.live_overflows = 0
+            self.live_underruns = 0
+            self.live_processing = True
+            output_channels = 2 if int(output_device.get("output", 1) if output_device else 1) >= 2 else 1
+            input_stream = sd.InputStream(device=input_index, samplerate=SAMPLE_RATE, channels=1, blocksize=FRAME_SIZE, dtype="float32", callback=self._live_input_callback)
+            output_stream = sd.OutputStream(device=output_index, samplerate=SAMPLE_RATE, channels=output_channels, blocksize=FRAME_SIZE, dtype="float32", callback=self._live_output_callback)
+            self.live_streams = [input_stream, output_stream]
+            input_stream.start()
+            output_stream.start()
+            self.live_worker = threading.Thread(target=self._live_worker, daemon=True)
+            self.live_worker.start()
+            self.status_var.set("LIVE PROCESSING")
+            self.engine_status_var.set("LIVE")
+            return True
+        except Exception as exc:
+            self.live_processing = False
+            self.live_stop.set()
+            self._close_live_streams()
+            self._clear_live_queues()
+            self._error(f"Live processing start failed: {exc}. Check the microphone, output device, and Linux audio configuration.")
+            return False
+
+    def _live_worker(self):
+        while not self.live_stop.is_set():
+            try:
+                frame = self.live_input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                output = self.engine.process_frame(frame)
+                try:
+                    self.live_output_queue.put_nowait(output)
+                except queue.Full:
+                    try:
+                        self.live_output_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.live_output_queue.put_nowait(output)
+                    except queue.Full:
+                        self.live_overflows += 1
+                        self._live_diagnostic("output queue overflow; dropped oldest frame", self.live_overflows)
+            except Exception as exc:
+                self.processing_errors += 1
+                print(f"[Live] Processing ERROR: {exc}")
+                self.live_processing = False
+                self.live_stop.set()
+                self.root.after(0, self._live_processing_failed, str(exc))
+                return
+
+    def _close_live_streams(self):
+        for stream in self.live_streams:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception as exc:
+                print(f"[Live] Stream close ERROR: {exc}")
+        self.live_streams = []
+
+    def _live_processing_failed(self, error):
+        self.stop_live_processing()
+        self.live_button.config(text="START LIVE PROCESSING", bg="#6e9b42")
+        self._error(f"Live RNNoise processing failed: {error}")
+
+    def stop_live_processing(self):
+        if not self.live_processing and not self.live_streams:
+            self._clear_live_queues()
+            return True
+        self.live_processing = False
+        self.live_stop.set()
+        self._close_live_streams()
+        if self.live_worker is not None:
+            self.live_worker.join()
+            self.live_worker = None
+        self._clear_live_queues()
+        self.status_var.set("SYSTEM READY")
+        print(f"[Live] Stopped safely; input overflows={self.live_overflows}, output underruns={self.live_underruns}")
+        return True
+
     def start_recording(self):
         if self.recording:
+            return
+        if self.live_processing:
+            self._error("Stop live processing before starting a recording.")
             return
         if not self.inputs:
             self._error("No microphone is available. Connect a USB mic or headset and retry.")
@@ -474,6 +688,9 @@ class NoiselessApp:
         self.duration_original_var.set(f"Duration: {len(self.noisy_audio) / SAMPLE_RATE:.2f} s")
 
     def process_audio(self):
+        if self.live_processing:
+            self._error("Stop live processing before offline processing.")
+            return
         if not self.noisy_audio.size:
             self._error("Record audio before processing.")
             return
@@ -540,6 +757,9 @@ class NoiselessApp:
         if not self.outputs:
             self._error("No output device is available. Connect a speaker or Bluetooth headset and retry.")
             return
+
+        if self.live_processing:
+            self.stop_live_processing()
 
         values = np.clip(values * PLAYBACK_GAIN, -1.0, 1.0).astype(np.float32)
         print(f"[Playback] Listening gain: {PLAYBACK_GAIN:.1f}x (playback only)")
@@ -674,8 +894,17 @@ class NoiselessApp:
 
     def close(self):
         self._close_gpio_buttons()
-        self.recording = False
+        if self.recording:
+            self.recording = False
+            if self.capture_stream is not None:
+                self.capture_stream.stop()
+                self.capture_stream.close()
+                self.capture_stream = None
+            if self.capture_worker is not None:
+                self.capture_worker.join()
+                self.capture_worker = None
         self.stop_playback()
+        self.stop_live_processing()
         if self.capture_stream is not None:
             self.capture_stream.stop()
             self.capture_stream.close()
