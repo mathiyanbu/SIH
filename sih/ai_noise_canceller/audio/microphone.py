@@ -97,8 +97,13 @@ def is_bluetooth_device(device):
     return any(keyword in name for keyword in ("bluetooth", "bluez", "a2dp", "headset", "earbuds", "airpods"))
 
 
+def is_pipewire_device(device):
+    name = str(device.get("name", "")).strip().lower()
+    return name == "pipewire" or name.startswith("pipewire ")
+
+
 def select_output_device(devices=None):
-    """Choose a capable output, preferring Bluetooth, then existing USB, then default."""
+    """Choose a capable output, preferring Bluetooth, PipeWire, default, then USB."""
     devices = devices if devices is not None else list_audio_devices()
     outputs = [device for device in devices if int(device.get("output", 0) or 0) > 0]
     if not outputs:
@@ -108,16 +113,20 @@ def select_output_device(devices=None):
     if bluetooth_output is not None:
         return int(bluetooth_output["index"])
 
+    pipewire_output = next((device for device in outputs if is_pipewire_device(device)), None)
+    if pipewire_output is not None:
+        return int(pipewire_output["index"])
+
+    default_index = get_default_output_index()
+    if default_index is not None:
+        return default_index
+
     usb_output = next(
         (device for device in outputs if any(keyword in str(device.get("name", "")).lower() for keyword in ("usb", "usb pnp", "pcm2902"))),
         None,
     )
     if usb_output is not None:
         return int(usb_output["index"])
-
-    default_index = get_default_output_index()
-    if default_index is not None:
-        return default_index
     return int(outputs[0]["index"])
 
 

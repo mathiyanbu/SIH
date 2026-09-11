@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import platform
 import queue
 import threading
@@ -28,6 +29,7 @@ from ai_noise_canceller.audio.microphone import (
     normalize_device_index,
     resolve_device_index,
     is_bluetooth_device,
+    is_pipewire_device,
     select_output_device,
 )
 from noise_suppression.rnnoise_engine import RNNoiseEngine, RNNoiseLoadError
@@ -40,6 +42,7 @@ PLAYBACK_GAIN = 2.0
 GPIO_RECORD_PIN = 17
 GPIO_PLAY_ORIGINAL_PIN = 27
 GPIO_PLAY_PROCESSED_PIN = 22
+GPIO_LIVE_PIN = 23
 
 
 def dbfs(audio: np.ndarray) -> float:
@@ -114,6 +117,11 @@ class NoiselessApp:
         self.live_overflows = 0
         self.live_underruns = 0
         self.live_last_diagnostic = 0.0
+        self.live_waveform_lock = threading.Lock()
+        self.live_input_wave_frames = deque(maxlen=100)
+        self.live_output_wave_frames = deque(maxlen=100)
+        self.live_waveform_after_id = None
+        self.closing = False
         self.ai_enabled = True
         self.input_overflows = 0
         self.processing_errors = 0
@@ -174,11 +182,13 @@ class NoiselessApp:
             record_button = Button(GPIO_RECORD_PIN, pull_up=True, bounce_time=0.2)
             original_button = Button(GPIO_PLAY_ORIGINAL_PIN, pull_up=True, bounce_time=0.2)
             processed_button = Button(GPIO_PLAY_PROCESSED_PIN, pull_up=True, bounce_time=0.2)
-            self.gpio_buttons = [record_button, original_button, processed_button]
+            live_button = Button(GPIO_LIVE_PIN, pull_up=True, bounce_time=0.2)
+            self.gpio_buttons = [record_button, original_button, processed_button, live_button]
             record_button.when_pressed = lambda: self.root.after(0, self._toggle_recording)
             original_button.when_pressed = lambda: self.root.after(0, self._play_original_audio)
             processed_button.when_pressed = lambda: self.root.after(0, self._play_processed_audio)
-            print("[GPIO] Buttons ready: GPIO17 record/stop, GPIO27 original, GPIO22 processed")
+            live_button.when_pressed = lambda: self.root.after(0, self.toggle_live_processing)
+            print("[GPIO] Buttons ready: GPIO17 record/stop, GPIO27 original, GPIO22 processed, GPIO23 live")
         except Exception as exc:
             print(f"[GPIO] Buttons unavailable: {exc}")
             self._close_gpio_buttons()
@@ -375,6 +385,7 @@ class NoiselessApp:
             self.led.config(fg="#e4b55d")
         else:
             self.led.config(fg="#37df8b")
+        self._report_live_diagnostics()
         self.root.after(40, self._ui_tick)
 
     def _draw_wave(self, canvas, values):
@@ -399,6 +410,24 @@ class NoiselessApp:
         canvas.create_text(16, 14, text="+1", fill="#718169", anchor="w", font=("Arial", 8))
         canvas.create_text(16, height - 10, text="-1", fill="#718169", anchor="w", font=("Arial", 8))
 
+    def _start_live_waveform_updates(self):
+        if self.live_waveform_after_id is None:
+            self.live_waveform_after_id = self.root.after(60, self._update_live_waveforms)
+
+    def _update_live_waveforms(self):
+        self.live_waveform_after_id = None
+        if self.closing:
+            return
+        with self.live_waveform_lock:
+            input_frames = list(self.live_input_wave_frames)
+            output_frames = list(self.live_output_wave_frames)
+        if input_frames:
+            self._draw_wave(self.input_wave, np.concatenate(input_frames))
+        if output_frames:
+            self._draw_wave(self.output_wave, np.concatenate(output_frames))
+        if self.live_processing:
+            self.live_waveform_after_id = self.root.after(60, self._update_live_waveforms)
+
     def _capture_callback(self, indata, frames, time_info, status):
         if not self.recording:
             return
@@ -412,6 +441,14 @@ class NoiselessApp:
         if count == 1 or now - self.live_last_diagnostic >= 2.0:
             print(f"[Live] {message}: {count}")
             self.live_last_diagnostic = now
+
+    def _report_live_diagnostics(self):
+        total = self.live_overflows + self.live_underruns
+        if total:
+            self._live_diagnostic(
+                f"buffer events (underruns/overflows={self.live_underruns}/{self.live_overflows})",
+                total,
+            )
 
     def _enumerate_devices(self):
         self.devices = audio_devices()
@@ -457,10 +494,12 @@ class NoiselessApp:
         if not self.live_processing:
             return
         try:
-            self.live_input_queue.put_nowait(np.asarray(indata[:, 0], dtype=np.float32).copy())
+            audio = np.asarray(indata[:, 0], dtype=np.float32).copy()
+            self.live_input_queue.put_nowait(audio)
+            with self.live_waveform_lock:
+                self.live_input_wave_frames.append(audio)
         except queue.Full:
             self.live_overflows += 1
-            self._live_diagnostic("input queue overflow; dropped frame", self.live_overflows)
 
     def _live_output_callback(self, outdata, frames, time_info, status):
         outdata.fill(0)
@@ -470,7 +509,6 @@ class NoiselessApp:
             frame = self.live_output_queue.get_nowait()
         except queue.Empty:
             self.live_underruns += 1
-            self._live_diagnostic("output underrun; emitted silence", self.live_underruns)
             return
         count = min(frames, len(frame))
         outdata[:count, 0] = frame[:count]
@@ -514,8 +552,10 @@ class NoiselessApp:
 
         input_device = next((device for device in self.inputs if device["index"] == input_index), None)
         output_device = next((device for device in self.outputs if device["index"] == output_index), None)
-        if not any(is_bluetooth_device(device) for device in self.outputs):
-            print("[Live] Bluetooth sink is not visible to PortAudio; using a valid fallback output.")
+        if is_pipewire_device(output_device or {}):
+            print("[Live] Using PipeWire default output route.")
+        elif not any(is_bluetooth_device(device) for device in self.outputs):
+            print("[Live] Direct Bluetooth sink is not visible to PortAudio; using a valid fallback output.")
         self.stop_playback()
         print(f"[Live] Input device: [{input_index}] {input_device['name'] if input_device else 'Default input'}")
         print(f"[Live] Output device: [{output_index}] {output_device['name'] if output_device else 'Default output'}")
@@ -523,6 +563,9 @@ class NoiselessApp:
             self.live_input_queue = queue.Queue(maxsize=8)
             self.live_output_queue = queue.Queue(maxsize=16)
             self._clear_live_queues()
+            with self.live_waveform_lock:
+                self.live_input_wave_frames.clear()
+                self.live_output_wave_frames.clear()
             self.live_stop.clear()
             self.live_overflows = 0
             self.live_underruns = 0
@@ -535,6 +578,7 @@ class NoiselessApp:
             output_stream.start()
             self.live_worker = threading.Thread(target=self._live_worker, daemon=True)
             self.live_worker.start()
+            self._start_live_waveform_updates()
             self.status_var.set("LIVE PROCESSING")
             self.engine_status_var.set("LIVE")
             return True
@@ -554,6 +598,8 @@ class NoiselessApp:
                 continue
             try:
                 output = self.engine.process_frame(frame)
+                with self.live_waveform_lock:
+                    self.live_output_wave_frames.append(np.asarray(output, dtype=np.float32).copy())
                 try:
                     self.live_output_queue.put_nowait(output)
                 except queue.Full:
@@ -592,6 +638,8 @@ class NoiselessApp:
         self._error(f"Live RNNoise processing failed: {error}")
 
     def stop_live_processing(self):
+        if hasattr(self, "live_button"):
+            self.live_button.config(text="START LIVE PROCESSING", bg="#6e9b42")
         if not self.live_processing and not self.live_streams:
             self._clear_live_queues()
             return True
@@ -602,6 +650,12 @@ class NoiselessApp:
             self.live_worker.join()
             self.live_worker = None
         self._clear_live_queues()
+        if self.live_waveform_after_id is not None:
+            try:
+                self.root.after_cancel(self.live_waveform_after_id)
+            except tk.TclError:
+                pass
+            self.live_waveform_after_id = None
         self.status_var.set("SYSTEM READY")
         print(f"[Live] Stopped safely; input overflows={self.live_overflows}, output underruns={self.live_underruns}")
         return True
@@ -893,6 +947,7 @@ class NoiselessApp:
             print(text)
 
     def close(self):
+        self.closing = True
         self._close_gpio_buttons()
         if self.recording:
             self.recording = False
